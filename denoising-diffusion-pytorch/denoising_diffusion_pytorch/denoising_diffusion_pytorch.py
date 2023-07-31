@@ -659,7 +659,7 @@ class Trainer(object):
             print(dataset)
             self.ds = Dataset(folder, image_size)
 
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=shuffle, pin_memory=True, num_workers=16, drop_last=True))
+        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=shuffle, pin_memory=True, num_workers=8, drop_last=True))
 
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.step = 0
@@ -726,7 +726,61 @@ class Trainer(object):
         cv2.imwrite(path, vcat)
 
 
+    def convert_to_pink_noise(self, batch_image):
+        """Convert the given batch of images to pink noise.
 
+        Args:
+            batch_image (torch.Tensor): Input batch of images in the frequency domain.
+
+        Returns:
+            torch.Tensor: Batch of pink noise images in the frequency domain.
+        """
+        # Get the batch size, number of channels, height, and width of the images
+        batch_size, channels, height, width = batch_image.shape
+        
+        # Calculate the frequencies
+        x = torch.arange(0, width, dtype=torch.float32)
+        y = torch.arange(0, height, dtype=torch.float32)
+        x, y = torch.meshgrid(x, y)
+        freqs = torch.sqrt(x**2 + y**2)
+        freqs[0, 0] = 1  # Avoid division by zero
+
+        # Apply the inverse proportional filter to each channel of each image in the batch
+        pink_noise = batch_image / freqs.view(1, 1, height, width)
+
+        # Set the DC (0 frequency) component to zero to avoid division by zero
+        pink_noise[:, :, 0, 0] = 0
+
+        return pink_noise
+
+    def normalize_image_batch(self, batch_image):
+        """Normalize the batch of images values to be within the valid image range [0, 255].
+
+        Args:
+            batch_image (torch.Tensor): Input batch of images.
+
+        Returns:
+            torch.Tensor: Normalized batch of images.
+        """
+        min_val = batch_image.min()
+        max_val = batch_image.max()
+        normalized_batch = (batch_image - min_val) / (max_val - min_val)
+        return normalized_batch
+
+    def pink_noise(self, gaussian_noise_batch):
+
+        # Compute the Fourier transform of the batch of Gaussian noise images
+        fft_batch = torch.fft.fft2(gaussian_noise_batch, dim=(-2, -1))
+
+        # Convert to pink noise
+        pink_noise_batch = self.convert_to_pink_noise(fft_batch)
+
+        # Compute the inverse Fourier transform to get the pink noise batch in spatial domain
+        pink_noise_batch = torch.fft.ifft2(pink_noise_batch, dim=(-2, -1)).real
+
+        # Normalize the real component of pink noise images to be within the valid image range
+        pink_noise_batch_normalized = self.normalize_image_batch(pink_noise_batch)
+        return pink_noise_batch_normalized
     def train(self):
 
         backwards = partial(loss_backwards, self.fp16)
@@ -737,7 +791,7 @@ class Trainer(object):
             for i in range(self.gradient_accumulate_every):
                 data_1 = next(self.dl)
                 data_2 = torch.randn_like(data_1)
-
+                data_2 = self.pink_noise(data_2)
                 data_1, data_2 = data_1.cuda(), data_2.cuda()
                 loss = torch.mean(self.model(data_1, data_2))
                 if self.step % 100 == 0:
@@ -759,6 +813,7 @@ class Trainer(object):
 
                 data_1 = next(self.dl)
                 data_2 = torch.randn_like(data_1)
+                data_2 = self.pink_noise(data_2)
                 og_img = data_2.cuda()
 
                 xt, direct_recons, all_images = self.ema_model.module.sample(batch_size=batches, img=og_img)
